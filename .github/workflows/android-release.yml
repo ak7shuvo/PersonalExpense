@@ -1,0 +1,265 @@
+name: Android CI & Release
+
+# Branch push / manual run  -> tests + lint + debug APK, uploaded as the "PersonalExpense-debug" artifact.
+# Tag push (vX.Y.Z)         -> tests + lint + release APK, published to a GitHub Release.
+on:
+  push:
+    branches:
+      - main
+      # Temporary: lets the pipeline be exercised from the development branch before it is merged.
+      - claude/wizardly-lovelace-thgeny
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# Default is read-only; the release job opts in to contents: write.
+permissions:
+  contents: read
+
+env:
+  JAVA_VERSION: '17'
+  ANDROID_PACKAGES: 'platforms;android-35 build-tools;34.0.0 platform-tools'
+  BUILD_TOOLS: '34.0.0'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Debug build: every push to a branch and every manual run.
+  # ---------------------------------------------------------------------------
+  debug:
+    name: Test, lint & build debug APK
+    if: github.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: debug-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Android SDK (accepts licenses)
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ${{ env.ANDROID_PACKAGES }}
+
+      - name: Set up Gradle (validates wrapper, caches dependencies)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Unit tests, lint and assemble debug
+        run: ./gradlew --no-daemon --stacktrace testDebugUnitTest lintDebug assembleDebug
+
+      - name: Stage APK
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk dist/PersonalExpense-debug.apk
+          sha256sum dist/PersonalExpense-debug.apk
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PersonalExpense-debug
+          path: dist/PersonalExpense-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload test and lint reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PersonalExpense-debug-reports
+          path: |
+            app/build/reports/tests/
+            app/build/reports/lint-results-debug.html
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Release build: only for version tags (vX.Y.Z or vX.Y.Z-suffix).
+  # ---------------------------------------------------------------------------
+  release:
+    name: Build & publish release
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.ref_name }}
+      cancel-in-progress: false
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Validate tag
+        id: version
+        run: |
+          set -euo pipefail
+          re='^v([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z.-]+)?$'
+          if [[ ! "$TAG" =~ $re ]]; then
+            echo "::error::Tag '$TAG' must look like v1.2.3 or v1.2.3-rc.1"
+            exit 1
+          fi
+          major="${BASH_REMATCH[1]}"; minor="${BASH_REMATCH[2]}"; patch="${BASH_REMATCH[3]}"
+          if (( minor > 999 || patch > 999 || major > 2000 )); then
+            echo "::error::major<=2000, minor<=999, patch<=999 required (versionCode = major*1000000 + minor*1000 + patch)"
+            exit 1
+          fi
+          echo "name=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "code=$(( major * 1000000 + minor * 1000 + patch ))" >> "$GITHUB_OUTPUT"
+          if [[ -n "${BASH_REMATCH[4]}" ]]; then echo "prerelease=true" >> "$GITHUB_OUTPUT"; else echo "prerelease=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Check out (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require tag to be on the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$DEFAULT_BRANCH"
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/$DEFAULT_BRANCH"; then
+            echo "::error::$TAG points at a commit that is not on '$DEFAULT_BRANCH'. Merge first, then tag."
+            exit 1
+          fi
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Android SDK (accepts licenses)
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ${{ env.ANDROID_PACKAGES }}
+
+      - name: Set up Gradle (validates wrapper, caches dependencies)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Prepare signing
+        id: signing
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          set_count=0
+          for v in KS_B64 KS_PASS KEY_ALIAS KEY_PASS; do
+            if [[ -n "${!v}" ]]; then set_count=$((set_count + 1)); fi
+          done
+          if (( set_count == 0 )); then
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No signing secrets configured: the release APK will be UNSIGNED and cannot be installed until signed."
+          elif (( set_count == 4 )); then
+            keystore="$RUNNER_TEMP/release.jks"
+            echo "$KS_B64" | base64 --decode > "$keystore"
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+            echo "keystore=$keystore" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Incomplete signing secrets. Set all of ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD, or none."
+            exit 1
+          fi
+
+      - name: Unit tests, lint and assemble release
+        env:
+          PE_KEYSTORE_FILE: ${{ steps.signing.outputs.keystore }}
+          PE_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          PE_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          PE_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: >
+          ./gradlew --no-daemon --stacktrace
+          -PappVersionName=${{ steps.version.outputs.name }}
+          -PappVersionCode=${{ steps.version.outputs.code }}
+          test lintDebug assembleRelease
+
+      - name: Stage and verify APK
+        id: apk
+        env:
+          SIGNED: ${{ steps.signing.outputs.signed }}
+          VERSION: ${{ steps.version.outputs.name }}
+        run: |
+          set -euo pipefail
+          bt="$ANDROID_HOME/build-tools/$BUILD_TOOLS"
+          mkdir -p dist
+          if [[ "$SIGNED" == "true" ]]; then
+            src=app/build/outputs/apk/release/app-release.apk
+            out="dist/PersonalExpense-$TAG.apk"
+          else
+            src=app/build/outputs/apk/release/app-release-unsigned.apk
+            out="dist/PersonalExpense-$TAG-unsigned.apk"
+          fi
+          [[ -f "$src" ]] || { echo "::error::$src not found"; ls -R app/build/outputs/apk; exit 1; }
+          if [[ "$SIGNED" == "true" ]]; then
+            "$bt/apksigner" verify --verbose --print-certs "$src"
+          elif "$bt/apksigner" verify "$src" >/dev/null 2>&1; then
+            echo "::error::Expected an unsigned APK but it carries a signature."; exit 1
+          fi
+          cp "$src" "$out"
+          badging="$("$bt/aapt2" dump badging "$out" | head -n 1)"
+          echo "$badging"
+          grep -q "versionName='$VERSION'" <<<"$badging" || { echo "::error::APK versionName does not match $VERSION"; exit 1; }
+          (cd dist && sha256sum "$(basename "$out")" | tee "$(basename "$out").sha256")
+          echo "file=$(basename "$out")" >> "$GITHUB_OUTPUT"
+
+      - name: Write release notes
+        env:
+          SIGNED: ${{ steps.signing.outputs.signed }}
+          APK_FILE: ${{ steps.apk.outputs.file }}
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" -f tag_name="$TAG" --jq .body > changes.md
+          {
+            echo "## PersonalExpense $TAG"
+            echo
+            echo "Offline personal finance tracker: income, expenses, loans and repayments. Android 8.0+ (API 26), no permissions, no account."
+            echo
+            if [[ "$SIGNED" == "true" ]]; then
+              echo "**Install:** download \`$APK_FILE\` on your phone and open it (allow installs from your browser/file manager when asked). Signed with the project release key."
+            else
+              echo "> [!WARNING]"
+              echo "> **This APK is unsigned** because no signing secrets were configured. Android will refuse to install it until it is signed."
+              echo "> Add the signing secrets described in the README and re-run, or use the \`PersonalExpense-debug\` build artifact for testing."
+            fi
+            echo
+            echo "SHA-256 is attached as \`$APK_FILE.sha256\`."
+            echo
+            cat changes.md
+          } > notes.md
+
+      - name: Publish GitHub Release
+        env:
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists - refreshing its assets and notes."
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            flags=(--verify-tag --title "PersonalExpense $TAG" --notes-file notes.md)
+            if [[ "$PRERELEASE" == "true" ]]; then flags+=(--prerelease); fi
+            gh release create "$TAG" dist/* "${flags[@]}"
+          fi
+
+      - name: Upload release APK as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PersonalExpense-release
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.jks"
